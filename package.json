@@ -1,0 +1,12 @@
+{
+  "name": "sllm-agent",
+  "version": "0.1.0",
+  "type": "module",
+  "scripts": {
+    "explore": "node --env-file=.env --experimental-strip-types cli.ts"
+  },
+  "dependencies": {
+    "@anthropic-ai/sdk": "^0.39.0",
+    "zod": "^4.3.6"
+  }
+}
