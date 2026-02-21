@@ -75,6 +75,10 @@ export interface SimulationConfig {
   trailDecayRate: number; // how fast trail marks fade (0-1 per tick)
   trailAvoidance: number; // how strongly tendrils avoid slimed areas (0-1)
   fanOutMultiplier: number; // how many extra probes to send during fan-out (2 = 2x initial)
+  mode: "explore" | "solve" | "sense"; // simulation mode
+  goals: string[]; // food sources for solver mode
+  inputFile: string | null; // input file for sensor mode (null = stdin)
+  batchSize: number; // lines per tick in sensor mode
 }
 
 export const DEFAULT_CONFIG: Omit<SimulationConfig, "seed"> = {
@@ -93,6 +97,10 @@ export const DEFAULT_CONFIG: Omit<SimulationConfig, "seed"> = {
   trailDecayRate: 0.03,
   trailAvoidance: 0.6,
   fanOutMultiplier: 2,
+  mode: "explore",
+  goals: [],
+  inputFile: null,
+  batchSize: 5,
 };
 
 // ── Simulation events (for render + logging) ─────────────────────────
@@ -126,6 +134,8 @@ export interface SenseResult {
   summary: string;
   directions: string[]; // new directions to explore
   relatedNodeIds: string[]; // existing nodes this connects to
+  goalScores?: Record<string, number>; // per-goal proximity scores (solver mode)
+  patterns?: string[]; // recurring patterns detected (sensor mode)
 }
 
 // ── Graph JSON export format ─────────────────────────────────────────

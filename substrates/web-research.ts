@@ -9,7 +9,7 @@
 import Anthropic from "@anthropic-ai/sdk";
 import { z } from "zod";
 import type { NutrientFunction } from "../nutrient.ts";
-import type { PhysarumGraph, SenseResult, Tendril } from "../types.ts";
+import type { PhysarumGraph, SenseResult, SimulationConfig, Tendril } from "../types.ts";
 import type { TrailStore } from "../trail.ts";
 import { sense as senseTrail, trailSummary } from "../trail.ts";
 import { log } from "../log.ts";
@@ -23,6 +23,7 @@ const SenseResponseSchema = z.object({
   summary: z.string(),
   directions: z.array(z.string()),
   relatedNodeIds: z.array(z.string()),
+  goalScores: z.record(z.number()).optional(),
 });
 
 // ── URL extraction from DDG redirects ────────────────────────────────
@@ -177,9 +178,23 @@ export const webResearch: NutrientFunction = {
     };
   },
 
-  async sense(content, tendril, graph, seed, trail) {
+  async sense(content, tendril, graph, seed, trail, config?) {
     const existingNodes = buildNodeContext(graph);
     const trailContext = trailSummary(trail);
+    const isSolver = config?.mode === "solve" && config.goals.length > 0;
+
+    const goalSection = isSolver
+      ? `\n## Goals (food sources):\n${config!.goals.map((g, i) => `${i + 1}. ${g}`).join("\n")}\n`
+      : "";
+
+    const goalScoringInstructions = isSolver
+      ? `\n  "goalScores": { "<goal text>": <0.0-1.0 how close this content is to that goal>, ... },
+IMPORTANT: Score against ALL goals. Give bonus nutrient if content bridges between multiple goals.`
+      : "";
+
+    const goalJsonField = isSolver
+      ? `\n  "goalScores": { "<goal>": <score>, ... },`
+      : "";
 
     const response = await client.messages.create({
       model: "claude-sonnet-4-5-20250929",
@@ -187,12 +202,12 @@ export const webResearch: NutrientFunction = {
       messages: [
         {
           role: "user",
-          content: `You are a research evaluator for a Physarum-inspired exploration agent.
+          content: `You are a research evaluator for a Physarum-inspired ${isSolver ? "solver" : "exploration"} agent.
 
 The organism is exploring: "${seed}"
 This tendril's direction: "${tendril.direction}"
 Tendril depth: ${tendril.depth}
-
+${goalSection}
 ## Existing nodes in the network:
 ${existingNodes}
 
@@ -206,12 +221,12 @@ ${content.slice(0, 4000)}
 Evaluate this content and respond with ONLY a JSON object (no markdown, no backticks):
 
 {
-  "nutrient": <0.0-1.0 how relevant/valuable this is to the seed topic>,
+  "nutrient": <0.0-1.0 how relevant/valuable this is${isSolver ? " to the goals" : " to the seed topic"}>,
   "summary": "<1-2 sentence summary of what was found>",
   "directions": ["<3-5 new directions to explore based on this — more if the content is rich>"],
-  "relatedNodeIds": ["<IDs of existing nodes this content connects to, if any>"]
+  "relatedNodeIds": ["<IDs of existing nodes this content connects to, if any>"]${goalJsonField}
 }
-
+${goalScoringInstructions}
 IMPORTANT for directions: Propose directions into UNEXPLORED territory.
 Check the slime trail above — if an area has been explored, go somewhere else.
 The most interesting signal is the ABSENCE of slime — the gaps in what's been covered.

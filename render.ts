@@ -244,9 +244,10 @@ export function render(state: SimulationState): void {
   const lines: string[] = [];
 
   // header
+  const modeLabel = state.config.mode === "solve" ? "SOLVER" : state.config.mode === "sense" ? "SENSOR" : "EXPLORER";
   lines.push(CLEAR);
   lines.push(
-    `${BOLD}${MAGENTA}▓▓ PHYSARUM ▓▓${RESET}  ` +
+    `${BOLD}${MAGENTA}▓▓ PHYSARUM ${modeLabel} ▓▓${RESET}  ` +
       `tick ${BOLD}${state.tick}${RESET}  ` +
       `${CYAN}●${RESET} ${nodes.length} nodes  ` +
       `${WHITE}─${RESET} ${edges.length} edges  ` +
@@ -254,6 +255,12 @@ export function render(state: SimulationState): void {
       `${DIM}▓${RESET} ${state.trail.marks.size} trail  ` +
       `API: ${state.resources.apiCallsUsed}/${state.resources.apiCallBudget}`
   );
+  if (state.config.mode === "solve" && state.config.goals.length > 0) {
+    lines.push(`${DIM}Goals: ${state.config.goals.join(" | ")}${RESET}`);
+  }
+  if (state.config.mode === "sense") {
+    lines.push(`${DIM}Input: ${state.config.inputFile ?? "stdin"} (batch: ${state.config.batchSize})${RESET}`);
+  }
   lines.push(`${DIM}${"─".repeat(cols - 2)}${RESET}`);
 
   // graph panel

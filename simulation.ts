@@ -21,6 +21,7 @@ import type {
   Tendril,
   SimEvent,
   GraphJSON,
+  SenseResult,
 } from "./types.ts";
 import {
   createGraph,
@@ -143,6 +144,64 @@ Respond with ONLY a JSON array of ${count} strings, each a short (5-15 word) exp
   );
 }
 
+// ── Solver: goal-directed direction generation ──────────────────────
+
+async function generateGoalDirections(
+  seed: string,
+  goals: string[],
+  count: number,
+  client: Anthropic,
+  trail: TrailStore
+): Promise<string[]> {
+  const trailContext = trailSummary(trail);
+  const perGoal = Math.max(1, Math.floor(count / goals.length));
+  const extra = count - perGoal * goals.length;
+
+  const response = await client.messages.create({
+    model: "claude-sonnet-4-5-20250929",
+    max_tokens: 2048,
+    messages: [
+      {
+        role: "user",
+        content: `You are a research exploration planner for a Physarum-inspired solver agent. The organism needs to find paths TOWARD specific goals and build bridges BETWEEN them.
+
+${seed ? `Context: "${seed}"\n` : ""}
+## Goals (food sources):
+${goals.map((g, i) => `${i + 1}. ${g}`).join("\n")}
+
+Generate ${count} exploration directions — at least ${perGoal} targeting each goal specifically, plus ${extra} that bridge between goals.
+
+For each goal: directions should seek content that directly advances understanding of that goal.
+For bridges: directions should connect two or more goals — look for intersections, shared principles, analogies.
+
+## Slime trail (already explored):
+${trailContext}
+
+Avoid directions that overlap with the slime trail. Explore the gaps.
+
+Respond with ONLY a JSON array of ${count} strings, each a short (5-15 word) exploration direction. No other text.`,
+      },
+    ],
+  });
+
+  const text = response.content
+    .filter((b): b is Anthropic.TextBlock => b.type === "text")
+    .map((b) => b.text)
+    .join("");
+
+  try {
+    const directions = JSON.parse(text);
+    if (Array.isArray(directions) && directions.every((d) => typeof d === "string")) {
+      return directions.slice(0, count);
+    }
+  } catch {
+    // fallback
+  }
+
+  // fallback: one direction per goal
+  return goals.map((g) => `explore: ${g}`);
+}
+
 // ── The simulation ───────────────────────────────────────────────────
 
 export interface SimulationState {
@@ -156,6 +215,8 @@ export interface SimulationState {
   spawnQueue: { direction: string; parentId: string; depth: number }[];
   done: boolean;
   stopReason: string;
+  inputIterator?: AsyncIterableIterator<string>; // sensor mode: line iterator
+  inputDone?: boolean; // sensor mode: stream exhausted
 }
 
 export function createSimulation(config: SimulationConfig, trail: TrailStore): SimulationState {
@@ -244,36 +305,91 @@ async function spawn(
   state: SimulationState,
   client: Anthropic
 ): Promise<void> {
-  const { initialTendrils, fanOutMultiplier } = state.config;
+  const { initialTendrils, fanOutMultiplier, mode } = state.config;
 
-  // tick 0: fan-out burst — extend pseudopods in all directions
-  if (state.tick === 0) {
-    const totalProbes = initialTendrils * fanOutMultiplier;
-    state.resources.apiCallsUsed++;
+  // ── Sensor mode: read batch from input stream each tick ──
+  if (mode === "sense") {
+    if (!state.inputIterator || state.inputDone) return;
 
-    log.tendril(`fan-out: extending ${totalProbes} pseudopods in all directions`);
+    const batch: string[] = [];
+    for (let i = 0; i < state.config.batchSize; i++) {
+      const { value, done } = await state.inputIterator.next();
+      if (done) {
+        state.inputDone = true;
+        break;
+      }
+      const line = (value as string).trim();
+      if (line.length > 0) batch.push(line);
+    }
 
-    const directions = await generateFanOutDirections(
-      state.config.seed,
-      totalProbes,
-      client,
-      state.trail
-    );
+    if (batch.length === 0) {
+      state.inputDone = true;
+      return;
+    }
 
-    for (let i = 0; i < directions.length; i++) {
-      const dir = directions[i];
-      // first N get full energy (the "core" tendrils)
-      // the rest are expendable probes — low energy, die fast if they find nothing
-      const isProbe = i >= initialTendrils;
-      const energy = isProbe ? 0.4 : 1.0;
-      const tendril = createTendril(dir, null, 0, energy);
+    log.tendril(`sensor: ingesting ${batch.length} lines`);
+    for (const line of batch) {
+      const tendril = createTendril(line, null, 0, 0.8);
       state.tendrils.push(tendril);
       state.events.push({
         type: "tendril_spawned",
         tendrilId: tendril.id,
-        direction: dir,
+        direction: line,
       });
-      log.tendril(`${isProbe ? "probe" : "core"} ${tendril.id}: "${dir}"`);
+      log.tendril(`sensor ${tendril.id}: "${line.slice(0, 60)}"`);
+    }
+    return;
+  }
+
+  // ── Tick 0: initial burst (explore + solve modes) ──
+  if (state.tick === 0) {
+    const totalProbes = initialTendrils * fanOutMultiplier;
+    state.resources.apiCallsUsed++;
+
+    if (mode === "solve") {
+      // Solver: generate goal-directed directions
+      log.tendril(`solver: extending ${totalProbes} pseudopods toward ${state.config.goals.length} goals`);
+      const directions = await generateGoalDirections(
+        state.config.seed,
+        state.config.goals,
+        totalProbes,
+        client,
+        state.trail
+      );
+
+      for (let i = 0; i < directions.length; i++) {
+        const tendril = createTendril(directions[i], null, 0, 1.0);
+        state.tendrils.push(tendril);
+        state.events.push({
+          type: "tendril_spawned",
+          tendrilId: tendril.id,
+          direction: directions[i],
+        });
+        log.tendril(`goal-seeker ${tendril.id}: "${directions[i]}"`);
+      }
+    } else {
+      // Explorer: existing fan-out burst
+      log.tendril(`fan-out: extending ${totalProbes} pseudopods in all directions`);
+      const directions = await generateFanOutDirections(
+        state.config.seed,
+        totalProbes,
+        client,
+        state.trail
+      );
+
+      for (let i = 0; i < directions.length; i++) {
+        const dir = directions[i];
+        const isProbe = i >= initialTendrils;
+        const energy = isProbe ? 0.4 : 1.0;
+        const tendril = createTendril(dir, null, 0, energy);
+        state.tendrils.push(tendril);
+        state.events.push({
+          type: "tendril_spawned",
+          tendrilId: tendril.id,
+          direction: dir,
+        });
+        log.tendril(`${isProbe ? "probe" : "core"} ${tendril.id}: "${dir}"`);
+      }
     }
     return;
   }
@@ -337,7 +453,8 @@ async function sense(
         tendril,
         state.graph,
         state.config.seed,
-        state.trail
+        state.trail,
+        state.config
       );
 
       // add node for this discovery
@@ -421,23 +538,51 @@ function depositTrail(state: SimulationState): void {
 // ── 6. Reinforce ─────────────────────────────────────────────────────
 
 function reinforce(state: SimulationState): void {
-  const { reinforcementBonus, trailAvoidance, fanOutMultiplier } = state.config;
+  const { reinforcementBonus, trailAvoidance, fanOutMultiplier, mode } = state.config;
 
   for (const tendril of state.tendrils) {
-    const result = (tendril as any)._lastSense;
+    const result = (tendril as any)._lastSense as SenseResult | undefined;
     if (!result) continue;
     delete (tendril as any)._lastSense;
     delete (tendril as any)._lastPayload;
 
-    if (result.nutrient > 0.5) {
-      // high nutrient: boost trail edges
+    // Sensor mode: base reinforcement on pattern recurrence, not just nutrient level
+    const threshold = mode === "sense" ? 0.3 : 0.5;
+
+    if (result.nutrient > threshold) {
       feed(tendril);
       awardEnergy(tendril, result.nutrient * reinforcementBonus);
 
       for (const edgeId of tendril.trail) {
         const edge = state.graph.edges.get(edgeId);
         if (edge) {
-          edge.conductivity = Math.min(1, edge.conductivity + result.nutrient * reinforcementBonus);
+          let bonus = result.nutrient * reinforcementBonus;
+
+          // Solver mode: extra boost for bridge edges
+          // (source and target score high on DIFFERENT goals → highway)
+          if (mode === "solve" && result.goalScores) {
+            const sourceNode = edge.source ? getNode(state.graph, edge.source) : null;
+            const targetNode = edge.target ? getNode(state.graph, edge.target) : null;
+            const sourceGoalScores = sourceNode ? (sourceNode.meta.goalScores as Record<string, number> | undefined) : undefined;
+            const targetGoalScores = targetNode ? (targetNode.meta.goalScores as Record<string, number> | undefined) : undefined;
+
+            if (sourceGoalScores && targetGoalScores) {
+              // check if they score high on different goals
+              const sourceTop = Object.entries(sourceGoalScores).sort((a, b) => b[1] - a[1])[0];
+              const targetTop = Object.entries(targetGoalScores).sort((a, b) => b[1] - a[1])[0];
+              if (sourceTop && targetTop && sourceTop[0] !== targetTop[0] && sourceTop[1] > 0.5 && targetTop[1] > 0.5) {
+                bonus *= 1.5; // bridge bonus
+                log.connect(`bridge edge ${edgeId}: ${sourceTop[0]} ↔ ${targetTop[0]}`);
+              }
+            }
+          }
+
+          // Sensor mode: extra boost for edges involving recurring patterns
+          if (mode === "sense" && result.patterns && result.patterns.length > 0) {
+            bonus *= 1 + result.patterns.length * 0.1;
+          }
+
+          edge.conductivity = Math.min(1, edge.conductivity + bonus);
           edge.reinforcements++;
           state.events.push({
             type: "reinforce",
@@ -447,18 +592,19 @@ function reinforce(state: SimulationState): void {
         }
       }
 
-      // Nutrient-triggered fan-out: rich finds cause a local burst of
-      // new pseudopods. The richer the nutrient, the bigger the burst.
-      // nutrient 0.5-0.7 → 2 sub-tendrils (normal branching)
-      // nutrient 0.7-0.9 → more branches (found something good)
-      // nutrient 0.9-1.0 → full fan-out burst (hit a vein of gold)
+      // Store goal scores on the node for solver bridge detection
+      if (mode === "solve" && result.goalScores && tendril.headNodeId) {
+        const node = getNode(state.graph, tendril.headNodeId);
+        if (node) node.meta.goalScores = result.goalScores;
+      }
+
+      // Nutrient-triggered fan-out
       const branchCount = result.nutrient >= 0.9
         ? Math.min(result.directions.length, fanOutMultiplier + 1)
         : result.nutrient >= 0.7
         ? Math.min(result.directions.length, Math.ceil(fanOutMultiplier * 0.75))
         : Math.min(result.directions.length, 2);
 
-      // filter by trail novelty — avoid slimed territory
       const ranked = rankByNovelty(
         state.trail,
         result.directions,
@@ -470,7 +616,6 @@ function reinforce(state: SimulationState): void {
         if (spawned >= branchCount) break;
 
         if (trailIntensity > trailAvoidance) {
-          // too much slime — skip this direction
           state.events.push({
             type: "trail_avoid",
             tendrilId: tendril.id,
@@ -480,10 +625,6 @@ function reinforce(state: SimulationState): void {
           log.decay(`avoided slimed direction: "${direction.slice(0, 40)}" (${trailIntensity.toFixed(2)})`);
           continue;
         }
-
-        // nutrient-triggered probes get slightly less energy than normal spawns
-        // they're exploratory, not committed
-        const probeEnergy = result.nutrient >= 0.9 ? 0.7 : 0.8;
 
         state.spawnQueue.push({
           direction,
@@ -497,7 +638,6 @@ function reinforce(state: SimulationState): void {
         log.tendril(`nutrient burst from ${tendril.id}! (${result.nutrient.toFixed(2)}) → ${spawned} new pseudopods`);
       }
     } else {
-      // low nutrient: drain energy
       starve(tendril);
       drainEnergy(tendril, 0.2);
     }
@@ -595,13 +735,9 @@ function pulse(state: SimulationState): void {
 
 function checkTermination(state: SimulationState): void {
   const active = getActiveTendrils(state.tendrils);
+  const { mode } = state.config;
 
-  if (active.length === 0 && state.spawnQueue.length === 0) {
-    state.done = true;
-    state.stopReason = "all tendrils dead";
-    return;
-  }
-
+  // common: budget exhaustion
   if (state.tick >= state.config.maxTicks) {
     state.done = true;
     state.stopReason = "max ticks reached";
@@ -614,7 +750,61 @@ function checkTermination(state: SimulationState): void {
     return;
   }
 
-  // stability check: if no new events in this tick (besides pulse/decay/trail)
+  // ── Sensor mode: terminate when input stream ends ──
+  if (mode === "sense") {
+    if (state.inputDone && active.length === 0 && state.spawnQueue.length === 0) {
+      state.done = true;
+      state.stopReason = "input stream exhausted";
+      return;
+    }
+    // don't apply stability check — sensor just keeps reading
+    return;
+  }
+
+  // ── Solver mode: check if all goals are reached and connected ──
+  if (mode === "solve") {
+    // still check all-dead
+    if (active.length === 0 && state.spawnQueue.length === 0) {
+      state.done = true;
+      state.stopReason = "all tendrils dead";
+      return;
+    }
+
+    // goal completion check
+    const goals = state.config.goals;
+    if (goals.length > 0 && state.tick > 3) {
+      const reachedGoals = new Set<string>();
+      for (const node of state.graph.nodes.values()) {
+        const goalScores = node.meta.goalScores as Record<string, number> | undefined;
+        if (goalScores) {
+          for (const [goal, score] of Object.entries(goalScores)) {
+            if (score > 0.7) reachedGoals.add(goal);
+          }
+        }
+      }
+
+      if (reachedGoals.size >= goals.length) {
+        // all goals reached — check connectivity
+        // (simplified: just check that cross-links exist)
+        const crossLinks = state.events.filter((e) => e.type === "cross_link").length;
+        if (crossLinks > 0 || state.graph.edges.size >= goals.length) {
+          state.done = true;
+          state.stopReason = "all goals reached and connected";
+          return;
+        }
+      }
+    }
+
+    // fall through to stability check
+  }
+
+  // ── Explorer + Solver: standard termination ──
+  if (active.length === 0 && state.spawnQueue.length === 0) {
+    state.done = true;
+    state.stopReason = "all tendrils dead";
+    return;
+  }
+
   const significantEvents = state.events.filter(
     (e) =>
       e.type === "node_added" ||
@@ -626,6 +816,32 @@ function checkTermination(state: SimulationState): void {
     state.done = true;
     state.stopReason = "network stabilized";
   }
+}
+
+// ── Input stream for sensor mode ─────────────────────────────────────
+
+async function* readLines(input: NodeJS.ReadableStream): AsyncIterableIterator<string> {
+  let buffer = "";
+  for await (const chunk of input) {
+    buffer += chunk;
+    const lines = buffer.split("\n");
+    buffer = lines.pop()!; // keep incomplete line in buffer
+    for (const line of lines) {
+      yield line;
+    }
+  }
+  if (buffer.length > 0) yield buffer;
+}
+
+async function openInputStream(config: SimulationConfig): Promise<AsyncIterableIterator<string>> {
+  if (config.inputFile) {
+    const { createReadStream } = await import("node:fs");
+    const stream = createReadStream(config.inputFile, { encoding: "utf-8" });
+    return readLines(stream);
+  }
+  // default: stdin
+  process.stdin.setEncoding("utf-8");
+  return readLines(process.stdin);
 }
 
 // ── Run simulation ───────────────────────────────────────────────────
@@ -644,8 +860,21 @@ export async function runSimulation(
 
   const state = createSimulation(config, trail);
 
-  log.info(`\n▓▓ Physarum Simulation ▓▓`);
+  // sensor mode: open input stream
+  if (config.mode === "sense") {
+    state.inputIterator = await openInputStream(config);
+    state.inputDone = false;
+  }
+
+  const modeLabel = config.mode === "solve" ? "Solver" : config.mode === "sense" ? "Sensor" : "Explorer";
+  log.info(`\n▓▓ Physarum Simulation (${modeLabel}) ▓▓`);
   log.info(`Seed: "${config.seed}"`);
+  if (config.mode === "solve" && config.goals.length > 0) {
+    log.info(`Goals: ${config.goals.join(", ")}`);
+  }
+  if (config.mode === "sense") {
+    log.info(`Input: ${config.inputFile ?? "stdin"}, batch size: ${config.batchSize}`);
+  }
   log.info(`Budget: ${config.maxApiCalls} API calls, ${config.maxTicks} ticks`);
   log.dim(`Concurrency: ${config.concurrency}, Decay: ${config.decayRate}`);
   log.dim(`Trail: ${trail.marks.size} existing marks, decay ${config.trailDecayRate}, avoidance ${config.trailAvoidance}`);

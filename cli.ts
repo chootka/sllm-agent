@@ -9,6 +9,7 @@ import { parseArgs } from "node:util";
 import { writeFile } from "node:fs/promises";
 import { runSimulation } from "./simulation.ts";
 import { webResearch } from "./substrates/web-research.ts";
+import { streamSubstrate } from "./substrates/stream.ts";
 import { render } from "./render.ts";
 import { log } from "./log.ts";
 import { DEFAULT_CONFIG, type SimulationConfig } from "./types.ts";
@@ -31,13 +32,35 @@ const { values, positionals } = parseArgs({
     "trail-decay": { type: "string" },
     "trail-avoidance": { type: "string" },
     "fan-out": { type: "string", short: "f" },
+    mode: { type: "string", short: "m" },
+    goals: { type: "string" },
+    input: { type: "string" },
+    "batch-size": { type: "string" },
     help: { type: "boolean", short: "h" },
   },
 });
 
-if (values.help || positionals.length === 0) {
+// ── Validate mode ────────────────────────────────────────────────────
+
+const mode = (values.mode ?? "explore") as "explore" | "solve" | "sense";
+if (!["explore", "solve", "sense"].includes(mode)) {
+  log.error(`Unknown mode: "${values.mode}". Available: explore, solve, sense`);
+  process.exit(1);
+}
+
+// ── Help ─────────────────────────────────────────────────────────────
+
+const needsSeed = mode === "explore" && positionals.length === 0;
+
+if (values.help || needsSeed) {
   console.error(`
-${"\x1b[1m"}Usage:${"\x1b[0m"} node --env-file=.env --experimental-strip-types cli.ts <seed> [options]
+${"\x1b[1m"}Usage:${"\x1b[0m"} node --env-file=.env --experimental-strip-types cli.ts [seed] [options]
+
+${"\x1b[1m"}Modes:${"\x1b[0m"}
+  --mode <explore|solve|sense>   Simulation mode (default: explore)
+    explore: fan out from seed, map the problem space
+    solve:   find paths between goals, build connection topology
+    sense:   read from stream, detect patterns and recurring themes
 
 ${"\x1b[1m"}Options:${"\x1b[0m"}
   --tendrils, -t <n>   Initial tendrils (default: ${DEFAULT_CONFIG.initialTendrils})
@@ -53,19 +76,44 @@ ${"\x1b[1m"}Options:${"\x1b[0m"}
   --trail-decay <rate> Trail decay rate 0-1 (default: ${DEFAULT_CONFIG.trailDecayRate})
   --trail-avoidance    How strongly to avoid slimed areas 0-1 (default: ${DEFAULT_CONFIG.trailAvoidance})
   --fan-out, -f <n>    Fan-out multiplier for initial burst (default: ${DEFAULT_CONFIG.fanOutMultiplier})
+  --goals <g1,g2,...>  Food sources for solver mode
+  --input <path>       Input file for sensor mode (default: stdin)
+  --batch-size <n>     Lines per tick in sensor mode (default: ${DEFAULT_CONFIG.batchSize})
   --help, -h           Show this help
 
-${"\x1b[1m"}Example:${"\x1b[0m"}
-  npm run explore -- "mesh networking alternative infrastructure" --ticks 20 --budget 40
+${"\x1b[1m"}Examples:${"\x1b[0m"}
+  ${"\x1b[2m"}# Explorer mode (default)${"\x1b[0m"}
+  npm run explore -- "mesh networking" --ticks 20 --budget 40
+
+  ${"\x1b[2m"}# Solver mode — find connections between goals${"\x1b[0m"}
+  npm run explore -- --mode solve --goals "mesh networking,solarpunk urbanism,mycelial networks" --budget 15
+
+  ${"\x1b[2m"}# Sensor mode — read from file${"\x1b[0m"}
+  npm run explore -- --mode sense --input data.txt --batch-size 10
+
+  ${"\x1b[2m"}# Sensor mode — read from stdin${"\x1b[0m"}
+  cat logs.txt | npm run explore -- --mode sense --budget 20
 `);
   process.exit(0);
 }
 
+// ── Build config ─────────────────────────────────────────────────────
+
 const seed = positionals.join(" ");
+const goals = values.goals ? values.goals.split(",").map((g) => g.trim()).filter(Boolean) : [];
+
+if (mode === "solve" && goals.length === 0) {
+  log.error("Solver mode requires --goals <g1,g2,...>");
+  process.exit(1);
+}
 
 const config: SimulationConfig = {
   ...DEFAULT_CONFIG,
   seed,
+  mode,
+  goals,
+  inputFile: values.input ?? DEFAULT_CONFIG.inputFile,
+  batchSize: values["batch-size"] ? parseInt(values["batch-size"], 10) : DEFAULT_CONFIG.batchSize,
   initialTendrils: values.tendrils ? parseInt(values.tendrils, 10) : DEFAULT_CONFIG.initialTendrils,
   maxTicks: values.ticks ? parseInt(values.ticks, 10) : DEFAULT_CONFIG.maxTicks,
   concurrency: values.concurrency ? parseInt(values.concurrency, 10) : DEFAULT_CONFIG.concurrency,
@@ -80,15 +128,20 @@ const config: SimulationConfig = {
 
 // ── Select substrate ─────────────────────────────────────────────────
 
-const substrateName = values.substrate ?? "web";
-const substrates: Record<string, typeof webResearch> = {
-  web: webResearch,
-};
-
-const substrate = substrates[substrateName];
-if (!substrate) {
-  log.error(`Unknown substrate: "${substrateName}". Available: ${Object.keys(substrates).join(", ")}`);
-  process.exit(1);
+let substrate;
+if (mode === "sense") {
+  // sensor mode always uses the stream substrate
+  substrate = streamSubstrate;
+} else {
+  const substrateName = values.substrate ?? "web";
+  const substrates: Record<string, typeof webResearch> = {
+    web: webResearch,
+  };
+  substrate = substrates[substrateName];
+  if (!substrate) {
+    log.error(`Unknown substrate: "${substrateName}". Available: ${Object.keys(substrates).join(", ")}`);
+    process.exit(1);
+  }
 }
 
 // ── Run ──────────────────────────────────────────────────────────────

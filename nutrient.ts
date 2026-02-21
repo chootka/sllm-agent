@@ -13,7 +13,7 @@
  * externalized memory — avoid slimed territory, deposit new marks.
  */
 
-import type { PhysarumGraph, SenseResult, Tendril } from "./types.ts";
+import type { PhysarumGraph, SenseResult, SimulationConfig, Tendril } from "./types.ts";
 import type { TrailStore } from "./trail.ts";
 
 export interface NutrientFunction {
@@ -31,6 +31,7 @@ export interface NutrientFunction {
     tendril: Tendril,
     graph: PhysarumGraph,
     seed: string,
-    trail: TrailStore
+    trail: TrailStore,
+    config?: SimulationConfig
   ): Promise<SenseResult>;
 }
