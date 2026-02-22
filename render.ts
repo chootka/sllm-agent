@@ -1,6 +1,10 @@
 /**
  * Live terminal visualization — ANSI escape codes, no external deps.
  *
+ * Uses the alternate screen buffer so the viz stays in place and
+ * doesn't pollute scrollback. When the simulation ends, we switch
+ * back to the normal buffer and the terminal is clean.
+ *
  * Three panels:
  * - Header: tick counter, stats
  * - Graph: force-directed 2D layout with ASCII nodes/edges
@@ -13,7 +17,12 @@ import type { PhysarumNode, PhysarumEdge, SimEvent } from "./types.ts";
 import { getActiveTendrils } from "./tendril.ts";
 
 const ESC = "\x1b";
-const CLEAR = `${ESC}[2J${ESC}[H`;
+const ALT_SCREEN_ON = `${ESC}[?1049h`;
+const ALT_SCREEN_OFF = `${ESC}[?1049l`;
+const CURSOR_HIDE = `${ESC}[?25l`;
+const CURSOR_SHOW = `${ESC}[?25h`;
+const CURSOR_HOME = `${ESC}[H`;
+const CLEAR_SCREEN = `${ESC}[2J`;
 const BOLD = `${ESC}[1m`;
 const DIM = `${ESC}[2m`;
 const RESET = `${ESC}[0m`;
@@ -26,6 +35,21 @@ const WHITE = `${ESC}[37m`;
 
 const EVENT_BUFFER_SIZE = 12;
 const eventBuffer: string[] = [];
+let entered = false;
+
+/** Enter the alternate screen buffer + hide cursor. */
+export function enterRenderMode(): void {
+  if (entered) return;
+  process.stderr.write(ALT_SCREEN_ON + CURSOR_HIDE + CLEAR_SCREEN);
+  entered = true;
+}
+
+/** Leave the alternate screen buffer + restore cursor. */
+export function exitRenderMode(): void {
+  if (!entered) return;
+  process.stderr.write(CURSOR_SHOW + ALT_SCREEN_OFF);
+  entered = false;
+}
 
 // ── Simple force-directed layout ─────────────────────────────────────
 
@@ -220,6 +244,8 @@ function formatEvent(event: SimEvent): string {
 // ── Main render function ─────────────────────────────────────────────
 
 export function render(state: SimulationState): void {
+  if (!entered) enterRenderMode();
+
   const cols = Math.min(process.stderr.columns || 80, 120);
   const rows = Math.min(process.stderr.rows || 40, 40);
 
@@ -245,7 +271,6 @@ export function render(state: SimulationState): void {
 
   // header
   const modeLabel = state.config.mode === "solve" ? "SOLVER" : state.config.mode === "sense" ? "SENSOR" : "EXPLORER";
-  lines.push(CLEAR);
   lines.push(
     `${BOLD}${MAGENTA}▓▓ PHYSARUM ${modeLabel} ▓▓${RESET}  ` +
       `tick ${BOLD}${state.tick}${RESET}  ` +
@@ -300,6 +325,6 @@ export function render(state: SimulationState): void {
     lines.push(`  ${evt}`);
   }
 
-  // write all at once to stderr
-  process.stderr.write(lines.join("\n") + "\n");
+  // move cursor to top-left and draw (no CLEAR — avoids flicker)
+  process.stderr.write(CURSOR_HOME + CLEAR_SCREEN + lines.join("\n") + "\n");
 }

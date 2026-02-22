@@ -10,7 +10,7 @@ import { writeFile } from "node:fs/promises";
 import { runSimulation } from "./simulation.ts";
 import { webResearch } from "./substrates/web-research.ts";
 import { streamSubstrate } from "./substrates/stream.ts";
-import { render } from "./render.ts";
+import { render, enterRenderMode, exitRenderMode } from "./render.ts";
 import { log } from "./log.ts";
 import { DEFAULT_CONFIG, type SimulationConfig } from "./types.ts";
 
@@ -146,10 +146,27 @@ if (mode === "sense") {
 
 // ── Run ──────────────────────────────────────────────────────────────
 
-const onTick = config.noRender ? undefined : render;
+const useRender = !config.noRender;
+const onTick = useRender ? render : undefined;
+
+// mute log output when live viz is active — the render panels show everything
+if (useRender) log.muted = true;
+
+// ensure we restore the terminal on exit (ctrl-c, crash, etc.)
+function cleanup() {
+  if (useRender) {
+    exitRenderMode();
+    log.muted = false;
+  }
+}
+process.on("SIGINT", () => { cleanup(); process.exit(130); });
+process.on("SIGTERM", () => { cleanup(); process.exit(143); });
 
 try {
   const result = await runSimulation(config, substrate, onTick);
+
+  // leave alt screen before printing results
+  cleanup();
 
   // output JSON to stdout if requested
   if (values.json) {
@@ -162,11 +179,17 @@ try {
     log.success(`Graph saved to ${values.save}`);
   }
 
-  // if neither --json nor --save, still print a summary
+  // print summary
+  log.success(
+    `\nDone: ${result.stats.totalNodes} nodes, ${result.stats.totalEdges} edges, ` +
+    `${result.stats.crossLinks} cross-links, ${result.stats.apiCallsUsed} API calls`
+  );
+
   if (!values.json && !values.save) {
-    log.info("\nUse --json to output the graph, or --save <path> to save it.");
+    log.info("Use --json to output the graph, or --save <path> to save it.");
   }
 } catch (err) {
+  cleanup();
   log.error(`\nSimulation failed: ${err instanceof Error ? err.message : String(err)}`);
   process.exit(1);
 }

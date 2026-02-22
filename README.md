@@ -6,30 +6,82 @@ A Physarum polycephalum (slime mould) simulation engine for AI-driven research e
 
 ### Explorer (default)
 
-Fan out from a seed topic in all directions. Map the problem space.
+**When to use it:** You have a topic and want to understand the landscape. You don't know what you don't know.
+
+**Scenarios:**
+- Researching a new domain before writing about it
+- Finding the unexpected angles on a familiar topic
+- Mapping the breadth of a field before diving deep
 
 ```
 npm run explore -- "mesh networking" --budget 40 --ticks 10
+npm run explore -- "history of fermentation" --budget 60 --ticks 15
 ```
+
+**What the output looks like:** A broad, branching graph. The seed sits in the center, and tendrils radiate outward into different sub-topics. Clusters form around rich areas. Weak dead-end branches get pruned away. What survives is what was worth finding.
+
+The nodes contain summaries like "Community mesh networks in Oaxaca bypass telecom monopolies" or "Sourdough starters contain symbiotic lactobacillus and wild yeast colonies". The high-conductivity edges between them tell you which discoveries were on the same productive path.
 
 ### Solver
 
-Define multiple goals (food sources). The organism finds efficient paths between them.
+**When to use it:** You have 2+ ideas and want to find how they connect. You know the destinations but not the routes between them.
+
+**Scenarios:**
+- Writing an essay that bridges disparate fields
+- Finding interdisciplinary connections for a research proposal
+- Discovering shared principles between things that seem unrelated
 
 ```
 npm run explore -- --mode solve \
   --goals "mesh networking,solarpunk urbanism,mycelial networks" \
-  --budget 15 --ticks 5
+  --budget 30 --ticks 8
+
+npm run explore -- --mode solve \
+  --goals "sourdough fermentation,gut microbiome,terroir in wine" \
+  --budget 40 --ticks 10
 ```
+
+**What the output looks like:** Instead of a radial map, you get a network where nodes cluster around each goal and bridge edges connect the clusters. Each node is scored against every goal (`goalScores` in the JSON), so you can see which discoveries serve multiple goals at once.
+
+The most valuable parts are the high-conductivity bridge edges — paths like "fermentation byproducts → postbiotic compounds → gut epithelial signaling" that connect "sourdough" to "gut microbiome" through unexpected intermediate steps. These bridges are the essay you didn't know how to write.
 
 ### Sensor
 
-Read from a stream (stdin or file). No active exploration — the input IS the substrate. Recurring patterns get reinforced, one-off noise gets pruned.
+**When to use it:** You have a body of text and want to know what it's about. Not a summary — a structural map of its recurring themes.
+
+**Scenarios:**
+- Understanding what patterns live in a log file
+- Finding the recurring themes in a collection of notes or journal entries
+- Analyzing what a corpus of documents is really about (vs what it claims to be about)
 
 ```
 cat server.log | npm run explore -- --mode sense --batch-size 10 --budget 30
-npm run explore -- --mode sense --input data.txt --budget 20
+npm run explore -- --mode sense --input field-notes.txt --budget 40
+npm run explore -- --mode sense --input chat-export.txt "what topics recur" --budget 30
 ```
+
+**What the output looks like:** The graph builds from the input rather than from web searches. Each line of input becomes a tendril. Lines that reinforce patterns already in the network get high nutrient scores; one-off noise gets low scores and fades away.
+
+What survives is the signal: the themes that kept coming back. Nodes contain pattern summaries like "repeated authentication failures from IP range 10.0.3.*" or "recurring anxiety about deadlines mentioned 12 times". The edges show which patterns co-occur.
+
+## What You Get
+
+### During the run
+
+A live terminal visualization (on the alternate screen — your scrollback stays clean). The graph updates each tick. Press ctrl-c to stop early; the terminal restores cleanly.
+
+Pass `--no-render` if you want scrolling log output instead of the live viz.
+
+### After the run
+
+Currently the output is:
+
+1. **A terminal summary** — node count, edge count, cross-links, API calls used
+2. **JSON graph** (with `--json` or `--save <path>`) — the full network with all nodes, edges, nutrient scores, conductivities, tendrils, and trail marks
+
+There is **no written report** yet. The JSON gives you everything, but you have to interpret the graph yourself. The nodes contain summaries and the edges tell you what connects, but nobody synthesizes it into prose.
+
+A natural next step would be a `--report` flag that feeds the final graph back to Claude and asks for a written synthesis — "given this network, what did we learn?" That doesn't exist yet.
 
 ## How It Works
 
