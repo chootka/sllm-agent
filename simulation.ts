@@ -56,6 +56,47 @@ import {
 } from "./trail.ts";
 import { log } from "./log.ts";
 
+// ── Retry with backoff for rate limits ───────────────────────────────
+//
+// Wraps any async call that might hit Anthropic's rate limit (HTTP 429).
+// On 429: wait, then retry. On anything else: throw immediately.
+//
+// Backoff schedule (if no retry-after header):
+//   attempt 0 → wait 2s
+//   attempt 1 → wait 4s
+//   attempt 2 → wait 8s
+//   (capped at 30s)
+//
+// If the API returns a retry-after header, we use that instead.
+
+async function withRetry<T>(fn: () => Promise<T>, label: string, maxRetries = 3): Promise<T> {
+  for (let attempt = 0; attempt <= maxRetries; attempt++) {
+    try {
+      return await fn();
+    } catch (err: any) {
+      // detect rate limits — Anthropic SDK throws with status 429,
+      // but also check the message in case the error shape differs
+      const status = err?.status ?? err?.statusCode;
+      const isRateLimit = status === 429 ||
+        (err?.message && typeof err.message === "string" && err.message.includes("rate_limit"));
+
+      if (isRateLimit && attempt < maxRetries) {
+        const retryAfter = err?.headers?.["retry-after"];
+        const waitMs = retryAfter
+          ? parseFloat(retryAfter) * 1000
+          : Math.min(2000 * Math.pow(2, attempt), 30000); // exponential backoff
+        log.warn(`  ${label}: rate limited, waiting ${(waitMs / 1000).toFixed(1)}s (attempt ${attempt + 1}/${maxRetries})`);
+        await new Promise((r) => setTimeout(r, waitMs));
+        continue;
+      }
+
+      // not a rate limit, or out of retries — let the caller handle it
+      throw err;
+    }
+  }
+  throw new Error("unreachable");
+}
+
 // ── Semaphore for concurrency limiting ───────────────────────────────
 
 class Semaphore {
@@ -96,13 +137,14 @@ async function generateFanOutDirections(
 ): Promise<string[]> {
   const trailContext = trailSummary(trail);
 
-  const response = await client.messages.create({
-    model: "claude-sonnet-4-5-20250929",
-    max_tokens: 2048,
-    messages: [
-      {
-        role: "user",
-        content: `You are a research exploration planner modeled on Physarum polycephalum (slime mould). When placed on a new substrate, the organism immediately fans out pseudopods in ALL directions — radially, maximally spread apart. Most will find nothing and retract. A few will hit food and explode outward again.
+  const response = await withRetry(
+    () => client.messages.create({
+      model: "claude-sonnet-4-5-20250929",
+      max_tokens: 2048,
+      messages: [
+        {
+          role: "user",
+          content: `You are a research exploration planner modeled on Physarum polycephalum (slime mould). When placed on a new substrate, the organism immediately fans out pseudopods in ALL directions — radially, maximally spread apart. Most will find nothing and retract. A few will hit food and explode outward again.
 
 Generate ${count} maximally diverse exploration directions for this seed topic. Think of them as pseudopods extending in every direction from a central point:
 
@@ -120,9 +162,11 @@ ${trailContext}
 IMPORTANT: Avoid directions that overlap with the slime trail above. Fan out into the GAPS. If the trail is empty, fan out freely in all directions.
 
 Respond with ONLY a JSON array of ${count} strings, each a short (5-15 word) exploration direction. No other text.`,
-      },
-    ],
-  });
+        },
+      ],
+    }),
+    "fan-out"
+  );
 
   const text = response.content
     .filter((b): b is Anthropic.TextBlock => b.type === "text")
@@ -157,13 +201,14 @@ async function generateGoalDirections(
   const perGoal = Math.max(1, Math.floor(count / goals.length));
   const extra = count - perGoal * goals.length;
 
-  const response = await client.messages.create({
-    model: "claude-sonnet-4-5-20250929",
-    max_tokens: 2048,
-    messages: [
-      {
-        role: "user",
-        content: `You are a research exploration planner for a Physarum-inspired solver agent. The organism needs to find paths TOWARD specific goals and build bridges BETWEEN them.
+  const response = await withRetry(
+    () => client.messages.create({
+      model: "claude-sonnet-4-5-20250929",
+      max_tokens: 2048,
+      messages: [
+        {
+          role: "user",
+          content: `You are a research exploration planner for a Physarum-inspired solver agent. The organism needs to find paths TOWARD specific goals and build bridges BETWEEN them.
 
 ${seed ? `Context: "${seed}"\n` : ""}
 ## Goals (food sources):
@@ -180,9 +225,11 @@ ${trailContext}
 Avoid directions that overlap with the slime trail. Explore the gaps.
 
 Respond with ONLY a JSON array of ${count} strings, each a short (5-15 word) exploration direction. No other text.`,
-      },
-    ],
-  });
+        },
+      ],
+    }),
+    "goal-directions"
+  );
 
   const text = response.content
     .filter((b): b is Anthropic.TextBlock => b.type === "text")
@@ -433,11 +480,14 @@ async function sense(
       // explore (substrate receives trail so it can avoid slimed URLs)
       state.resources.apiCallsUsed++;
       log.dim(`  ${tendril.id} exploring: "${tendril.direction}"`);
-      const { content, payload } = await substrate.explore(
-        tendril.direction,
-        tendril,
-        state.graph,
-        state.trail
+      const { content, payload } = await withRetry(
+        () => substrate.explore(
+          tendril.direction,
+          tendril,
+          state.graph,
+          state.trail
+        ),
+        tendril.id
       );
 
       if (!content || content.length < 20) {
@@ -448,13 +498,16 @@ async function sense(
 
       // sense (uses Claude, receives trail for context)
       state.resources.apiCallsUsed++;
-      const result = await substrate.sense(
-        content,
-        tendril,
-        state.graph,
-        state.config.seed,
-        state.trail,
-        state.config
+      const result = await withRetry(
+        () => substrate.sense(
+          content,
+          tendril,
+          state.graph,
+          state.config.seed,
+          state.trail,
+          state.config
+        ),
+        tendril.id
       );
 
       // add node for this discovery
